@@ -51,6 +51,14 @@ MainWindow::MainWindow(QWidget *parent)
     // 显示区
     ui->lblReader->setAlignment(Qt::AlignCenter);
     ui->lblReader->setScaledContents(false);
+    // ✅ 关键：取消标签的最小尺寸限制，允许它缩小到 1x1 像素
+    ui->lblReader->setMinimumSize(0, 0);
+    // ✅ 关键：调整尺寸策略，忽略内容建议的大小
+    ui->lblReader->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
+    // 如果你使用了布局，确保布局不会强制限制最小尺寸
+    if (ui->centralwidget->layout()) {
+        ui->centralwidget->layout()->setSizeConstraint(QLayout::SetNoConstraint);
+    }
     ui->lblReader->setFocusPolicy(Qt::NoFocus);
     ui->lblReader->setText(QStringLiteral(
         "按 Ctrl+O 打开 PDF\n"
