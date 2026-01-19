@@ -11,7 +11,7 @@
 #include <QPixmap>
 #include <QMenuBar>
 #include <QStatusBar>
-
+#include <QTimer>
 #include <QLabel>
 #include <QLineEdit>
 #include <QHBoxLayout>
@@ -20,6 +20,10 @@
 #include <QApplication>
 #include <QEvent>
 #include <QCursor>
+
+#include <QSettings>
+#include <QFileInfo>
+#include <QStandardPaths> // 用于获取默认系统路径
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -71,6 +75,11 @@ MainWindow::MainWindow(QWidget *parent)
     auto *scEsc = new QShortcut(QKeySequence(Qt::Key_Escape), this);
     connect(scEsc, &QShortcut::activated, this, [this](){ close(); });
 
+    // A键 退出
+    auto *scA = new QShortcut(QKeySequence(Qt::Key_A), this);
+    connect(scA, &QShortcut::activated, this, [this](){ close(); });
+
+
     // Tab：切换页码条显示隐藏
     auto *scToggleBar = new QShortcut(QKeySequence(Qt::Key_Tab), this);
     connect(scToggleBar, &QShortcut::activated, this, &MainWindow::togglePageBar);
@@ -84,6 +93,39 @@ MainWindow::MainWindow(QWidget *parent)
             m_pageEdit->selectAll();
         }
     });
+
+    // 绑定异步结果回调
+    connect(&m_renderWatcher, &QFutureWatcher<QImage>::finished,
+                this, &MainWindow::handleRenderFinished);
+
+
+    // 延迟一点点调用，确保 UI 布局已完成计算（可选）
+    QTimer::singleShot(100, this, &MainWindow::loadSession);
+
+}
+
+void MainWindow::handleRenderFinished()
+{
+    // 获取异步计算生成的图片
+    QImage img = m_renderWatcher.result();
+
+    if (img.isNull()) {
+        ui->lblReader->setText(QStringLiteral("渲染失败"));
+        return;
+    }
+
+    // 更新 UI（必须在主线程执行，handleRenderFinished 由信号触发，符合要求）
+    QPixmap pm = QPixmap::fromImage(img);
+    ui->lblReader->setPixmap(pm.scaled(
+        ui->lblReader->size(),
+        Qt::KeepAspectRatio,
+        Qt::SmoothTransformation
+    ));
+
+    // 更新状态栏/标题
+    int total = m_pdf->pageCount();
+    setWindowTitle(QString("Page %1 / %2 (Async Mode)").arg(m_currentPage + 1).arg(total));
+    updatePageBar();
 }
 
 MainWindow::~MainWindow()
@@ -95,21 +137,36 @@ MainWindow::~MainWindow()
 
 void MainWindow::openPdf()
 {
+    // 1. 初始化 QSettings (建议组织名与应用名与项目设置一致)
+    QSettings settings("MyCompany", "PdfReader");
+
+    // 2. 读取上次保存的路径，若无则默认为系统“文档”目录
+    QString defaultPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    QString lastDir = settings.value("last_dir", defaultPath).toString();
+
+    // 3. 打开文件对话框
     QString file = QFileDialog::getOpenFileName(
         this,
         QStringLiteral("选择 PDF 文件"),
-        QString(),
+        lastDir, // 使用上次的路径
         QStringLiteral("PDF Files (*.pdf)")
     );
+
     if (file.isEmpty()) return;
 
+    // 4. 加载 PDF 逻辑
     if (!m_pdf) m_pdf = new PdfDocument(this);
 
     if (!m_pdf->load(file)) {
-        ui->lblReader->setText(QStringLiteral("PDF 加载失败（可能是路径/权限/格式问题）"));
+        ui->lblReader->setText(QStringLiteral("PDF 加载失败"));
         return;
     }
 
+    // 5. 成功打开后，提取目录并持久化存储 (Persistence)
+    QFileInfo fileInfo(file);
+    settings.setValue("last_dir", fileInfo.absolutePath());
+
+    // 6. 更新状态
     m_currentFile = file;
     m_currentPage = 0;
     m_scale = 1.5;
@@ -119,34 +176,35 @@ void MainWindow::openPdf()
 
 void MainWindow::renderCurrentPage()
 {
-    if (!m_pdf) return;
+    if (!m_pdf || m_pdf->pageCount() <= 0) return;
 
-    const int total = m_pdf->pageCount();
-    if (total <= 0) {
-        ui->lblReader->setText(QStringLiteral("PDF 页数为 0"));
-        updatePageBar();
+    // 1. 边界修正
+    m_currentPage = qBound(0, m_currentPage, m_pdf->pageCount() - 1);
+
+    // 2. 如果当前正在渲染同一页，则不再重复发起
+    if (m_renderWatcher.isRunning() && m_renderingPage == m_currentPage) {
         return;
     }
 
-    m_currentPage = qBound(0, m_currentPage, total - 1);
+    // 3. 准备渲染参数
+    // 注意：lambda 捕获变量必须是值捕获，确保线程安全
+    int pageIdx = m_currentPage;
+    double scale = m_scale;
+    m_renderingPage = pageIdx;
 
-    QImage img = m_pdf->renderPage(m_currentPage, m_scale);
-    if (img.isNull()) {
-        ui->lblReader->setText(QStringLiteral("渲染失败"));
-        updatePageBar();
-        return;
-    }
+    // 4. 发起异步任务 (QtConcurrent::run)
+    // 使用线程池执行耗时的 PDF 渲染逻辑
+    QFuture<QImage> future = QtConcurrent::run([this, pageIdx, scale]() {
+        // 此处在后台线程执行
+        return m_pdf->renderPage(pageIdx, scale);
+    });
 
-    QPixmap pm = QPixmap::fromImage(img);
-    ui->lblReader->setPixmap(pm.scaled(
-        ui->lblReader->size(),
-        Qt::KeepAspectRatio,
-        Qt::SmoothTransformation
-    ));
+    m_renderWatcher.setFuture(future);
 
-    setWindowTitle(QString("Page %1 / %2").arg(m_currentPage + 1).arg(total));
-    updatePageBar();
+    // 5. UI 反馈：可以显示一个轻量的加载提示
+    // ui->lblReader->setText(QStringLiteral("渲染中..."));
 }
+
 
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
@@ -166,14 +224,24 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
         return;
     }
 
-    if (event->key() == Qt::Key_Right || event->key() == Qt::Key_PageDown || event->key() == Qt::Key_Down) {
+    // 下一页：S / → / ↓ / PageDown
+    if (event->key() == Qt::Key_S ||
+        event->key() == Qt::Key_Right ||
+        event->key() == Qt::Key_Down ||
+        event->key() == Qt::Key_PageDown)
+    {
         m_currentPage = qMin(m_currentPage + 1, m_pdf->pageCount() - 1);
         renderCurrentPage();
         event->accept();
         return;
     }
 
-    if (event->key() == Qt::Key_Left || event->key() == Qt::Key_PageUp || event->key() == Qt::Key_Up) {
+    // 上一页：W / ← / ↑ / PageUp
+    if (event->key() == Qt::Key_W ||
+        event->key() == Qt::Key_Left ||
+        event->key() == Qt::Key_Up ||
+        event->key() == Qt::Key_PageUp)
+    {
         m_currentPage = qMax(m_currentPage - 1, 0);
         renderCurrentPage();
         event->accept();
@@ -182,6 +250,7 @@ void MainWindow::keyPressEvent(QKeyEvent *event)
 
     QMainWindow::keyPressEvent(event);
 }
+
 
 void MainWindow::wheelEvent(QWheelEvent *event)
 {
@@ -361,6 +430,57 @@ void MainWindow::setPageBarVisible(bool visible)
 void MainWindow::togglePageBar()
 {
     setPageBarVisible(!m_pageBarVisible);
+}
+
+// 加载会话信息
+void MainWindow::loadSession()
+{
+    QSettings settings("MyCompany", "PdfReader");
+
+    // 1. 恢复窗口几何尺寸 (位置、大小、最大化状态)
+    // 传入一个空的 QByteArray 作为默认值
+    QByteArray geometry = settings.value("window/geometry").toByteArray();
+    if (!geometry.isEmpty()) {
+        restoreGeometry(geometry);
+    } else {
+        // 如果是首次运行，设置一个默认大小
+        resize(1200, 800);
+    }
+
+    // 2. 恢复上次打开的文件（之前的逻辑）
+    QString lastFile = settings.value("session/last_file").toString();
+    if (!lastFile.isEmpty() && QFile::exists(lastFile)) {
+        if (!m_pdf) m_pdf = new PdfDocument(this);
+        if (m_pdf->load(lastFile)) {
+            m_currentFile = lastFile;
+            m_currentPage = settings.value("session/last_page", 0).toInt();
+            m_scale = settings.value("session/last_scale", 1.5).toDouble();
+            renderCurrentPage();
+        }
+    }
+}
+
+// 保存会话信息
+void MainWindow::saveSession()
+{
+    QSettings settings("MyCompany", "PdfReader");
+
+    // 1. 保存窗口几何尺寸 (包含位置和大小)
+    settings.setValue("window/geometry", saveGeometry());
+
+    // 2. 保存文件相关状态
+    if (!m_currentFile.isEmpty()) {
+        settings.setValue("session/last_file", m_currentFile);
+        settings.setValue("session/last_page", m_currentPage);
+        settings.setValue("session/last_scale", m_scale);
+    }
+}
+
+// 4. 重写关闭事件处理函数 (Event Handler)
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    saveSession(); // 退出前最后一步保存
+    event->accept();
 }
 
 // ---------------- 无边框缩放/拖动（Windows） ----------------

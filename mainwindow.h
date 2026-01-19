@@ -2,6 +2,9 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
+#include <QtConcurrent>
+#include <QFutureWatcher>
+#include <QImage>
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -34,6 +37,9 @@ protected:
     // ✅ 全局拦截 Ctrl+滚轮（避免焦点变化/控件抢事件）
     bool eventFilter(QObject *watched, QEvent *event) override;
 
+    // 重写关闭事件，用于程序退出时保存状态
+    void closeEvent(QCloseEvent *event) override;
+
 #ifdef Q_OS_WIN
     bool nativeEvent(const QByteArray &eventType, void *message, long *result) override;
 #endif
@@ -49,6 +55,9 @@ private:
     void togglePageBar();
     void setPageBarVisible(bool visible);
 
+    void saveSession();   // 保存会话
+    void loadSession();   // 加载会话信息并自动打开
+
 private:
     Ui::MainWindow *ui;
 
@@ -63,6 +72,16 @@ private:
     QLineEdit *m_pageEdit = nullptr;
     QIntValidator *m_pageValidator = nullptr;
     bool m_pageBarVisible = false;
+
+private:
+    // 渲染监视器，用于监听异步任务完成
+    QFutureWatcher<QImage> m_renderWatcher;
+
+    // 渲染槽函数
+    void handleRenderFinished();
+
+    // 记录渲染时的参数，防止异步竞争导致页面错乱
+    int m_renderingPage = -1;
 };
 
 #endif // MAINWINDOW_H
